@@ -1,0 +1,51 @@
+- name: Ensure base packages
+  package:
+    name: [git, vim, tmux, nfs-common, chrony]
+    state: present
+  ignore_errors: yes
+
+- name: Create users
+  loop: "{{ create_users }}"
+  user:
+    name: "{{ item.name }}"
+    groups: "{{ item.groups }}"
+    append: yes
+    shell: /bin/bash
+    state: present
+
+- name: Enable password-less SSH (if provided)
+  when: ssh_public_key != ""
+  become_user: "{{ create_users[0].name }}"
+  authorized_key:
+    user: "{{ create_users[0].name }}"
+    key: "{{ ssh_public_key }}"
+
+- name: Secure ~/.ssh
+  file:
+    path: "~{{ create_users[0].name }}/.ssh"
+    mode: "0700"
+    state: directory
+
+- name: Mount NFS (runtime)
+  mount:
+    src: "{{ item.src }}"
+    path: "{{ item.path }}"
+    fstype: "{{ item.fstype }}"
+    opts: "{{ item.opts }}"
+    state: mounted
+  loop: "{{ nfs_mounts }}"
+
+- name: Persist NFS (fstab)
+  mount:
+    src: "{{ item.src }}"
+    path: "{{ item.path }}"
+    fstype: "{{ item.fstype }}"
+    opts: "{{ item.opts }}"
+    state: present
+  loop: "{{ nfs_mounts }}"
+
+- name: Ensure chrony enabled
+  service:
+    name: chrony
+    state: started
+    enabled: yes

@@ -1,0 +1,11 @@
+# Change ubuntu→ec2-user if using Amazon Linux
+sysadmin_group: "sudo"        # "wheel" for Amazon Linux
+create_users:
+  - { name: "ubuntu", groups: "{{ sysadmin_group }}" }
+
+ssh_public_key: ""            # injected from GitHub Secret
+
+# Comment these NFS lines if you don't use NFS yet
+nfs_server: "headnode"
+nfs_mounts:
+  - { src: "{{ nfs_server }}:/home", path: "/home", opts: "vers=3,_netdev,intr", fstype: "nfs" }

@@ -1,0 +1,68 @@
+name: Provision & Configure Compute Node 3
+
+on:
+  workflow_dispatch:
+    inputs:
+      provider:
+        description: "cloud provider: aws or oci"
+        required: true
+        default: "aws"
+
+jobs:
+  provision:
+    runs-on: ubuntu-latest
+    env:
+      TF_IN_AUTOMATION: "true"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Configure AWS credentials
+        if: ${{ github.event.inputs.provider == 'aws' }}
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+
+      - name: Terraform Init
+        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        run: terraform init -input=false
+
+      - name: Terraform Apply
+        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        run: |
+          terraform apply -auto-approve \
+            -var="region=${{ secrets.AWS_REGION }}" \
+            -var="name=${{ secrets.CLUSTER_NAME }}" \
+            -var="vpc_id=${{ secrets.AWS_VPC_ID }}" \
+            -var="vpc_cidr=${{ secrets.AWS_VPC_CIDR }}" \
+            -var="subnet_id=${{ secrets.AWS_SUBNET_ID }}" \
+            -var="ami_id=${{ secrets.AWS_AMI_ID }}" \
+            -var="ssh_cidr=${{ secrets.SSH_CIDR }}" \
+            -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
+            -var="public_key=${{ secrets.PUBLIC_KEY }}" \
+            -var="ssh_user=${{ secrets.SSH_USER }}"
+          terraform output -raw ansible_inventory > $GITHUB_WORKSPACE/ansible/inventory/hosts
+
+      - name: Show generated Ansible inventory
+        run: cat ansible/inventory/hosts
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Ansible
+        run: pip install ansible
+
+      - name: Run Ansible
+        env:
+          ANSIBLE_HOST_KEY_CHECKING: "false"
+        run: |
+          cd ansible
+          ansible -i inventory/hosts all -m ping
+          ansible-playbook -i inventory/hosts site.yml --ssh-extra-args="-o StrictHostKeyChecking=no"
