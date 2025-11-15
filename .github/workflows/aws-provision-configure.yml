@@ -15,21 +15,15 @@ jobs:
       TF_IN_AUTOMATION: "true"
 
     steps:
-      # ----------------------------------------------------------
       # 1) Checkout repository
-      # ----------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------
       # 2) Setup Terraform
-      # ----------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # ----------------------------------------------------------
       # 3) Configure AWS credentials
-      # ----------------------------------------------------------
       - name: Configure AWS credentials
         if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
@@ -38,9 +32,7 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # ----------------------------------------------------------
       # 4) Terraform init/apply
-      # ----------------------------------------------------------
       - name: Terraform Init
         working-directory: infra/terraform/aws
         run: terraform init -input=false
@@ -62,9 +54,7 @@ jobs:
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # ----------------------------------------------------------
       # 5) Read Terraform outputs (public_ip, ssh_user)
-      # ----------------------------------------------------------
       - name: Read Terraform outputs
         id: tfout
         working-directory: infra/terraform/aws
@@ -74,18 +64,15 @@ jobs:
           echo "public_ip=$(terraform output -raw public_ip)" >> "$GITHUB_OUTPUT"
           echo "ssh_user=$(terraform output -raw ssh_user)" >> "$GITHUB_OUTPUT"
 
-      # ----------------------------------------------------------
-      # 6) Prepare Ansible structure
-      # ----------------------------------------------------------
-      - name: Create inventory directory
+      # 6) Prepare Ansible directories
+      - name: Create inventory & vars directories
+        shell: bash
         run: |
           set -euo pipefail
           mkdir -p ansible/inventory
           mkdir -p ansible/group_vars
 
-      # ----------------------------------------------------------
-      # 7) Write SSH private key (from secret)
-      # ----------------------------------------------------------
+      # 7) Write SSH private key
       - name: Write SSH private key
         shell: bash
         env:
@@ -94,7 +81,6 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.ssh
           chmod 700 ~/.ssh
-          # Write the private key exactly as provided
           printf "%s\n" "$SSH_PRIVATE_KEY" > ~/.ssh/wits_a
           chmod 600 ~/.ssh/wits_a
 
@@ -104,9 +90,7 @@ jobs:
           set -euo pipefail
           ssh-keygen -y -f ~/.ssh/wits_a > ~/.ssh/wits_a.pub || true
 
-      # ----------------------------------------------------------
-      # 8) Add hosts to known_hosts to avoid StrictHostKeyChecking prompts
-      # ----------------------------------------------------------
+      # 8) Add hosts to known_hosts (avoid prompts)
       - name: Add hosts to known_hosts
         shell: bash
         env:
@@ -122,22 +106,19 @@ jobs:
             ssh-keyscan -T 5 -H "$HEADNODE_IP" >> ~/.ssh/known_hosts 2>/dev/null || true
           fi
 
-      # ----------------------------------------------------------
-      # 9) Write Ansible inventory (FIXED EOF BLOCK)
-      # ----------------------------------------------------------
+      # 9) Write Ansible inventory (NO HEREDOCS)
       - name: Write Ansible inventory
         shell: bash
+        env:
+          IP: ${{ steps.tfout.outputs.public_ip }}
+          USER: ${{ steps.tfout.outputs.ssh_user }}
         run: |
           set -euo pipefail
-          cat > ansible/inventory/hosts <<EOF
-[compute]
-${{ steps.tfout.outputs.public_ip }} ansible_user=${{ steps.tfout.outputs.ssh_user }}
-EOF
-          echo "Wrote ansible/inventory/hosts"
+          printf "[compute]\n%s ansible_user=%s\n" "$IP" "$USER" > ansible/inventory/hosts
+          echo "Wrote ansible/inventory/hosts:"
+          cat ansible/inventory/hosts
 
-      # ----------------------------------------------------------
-      # 10) Optionally pass headnode_ip to Ansible if secret set
-      # ----------------------------------------------------------
+      # 10) Optionally pass headnode_ip to Ansible (NO HEREDOCS)
       - name: Write group_vars/all (headnode_ip if present)
         shell: bash
         env:
@@ -145,17 +126,13 @@ EOF
         run: |
           set -euo pipefail
           if [ -n "${HEADNODE_PUBLIC_IP:-}" ]; then
-            cat > ansible/group_vars/all.yml <<EOF
-headnode_ip: ${HEADNODE_PUBLIC_IP}
-EOF
+            printf "headnode_ip: %s\n" "$HEADNODE_PUBLIC_IP" > ansible/group_vars/all.yml
             echo "Created ansible/group_vars/all.yml with headnode_ip=${HEADNODE_PUBLIC_IP}"
           else
             echo "HEADNODE_PUBLIC_IP not set; skipping group_vars."
           fi
 
-      # ----------------------------------------------------------
       # 11) Setup Python + Ansible
-      # ----------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -164,9 +141,7 @@ EOF
       - name: Install Ansible
         run: pip install --upgrade pip ansible
 
-      # ----------------------------------------------------------
       # 12) Smoke test (ping)
-      # ----------------------------------------------------------
       - name: Ping with Ansible
         env:
           SSH_KEY: ~/.ssh/wits_a
@@ -176,9 +151,7 @@ EOF
           cd ansible
           ansible -i inventory/hosts all -m ping --private-key "$SSH_KEY" --ssh-extra-args="-o StrictHostKeyChecking=no"
 
-      # ----------------------------------------------------------
       # 13) Run site.yml
-      # ----------------------------------------------------------
       - name: Run Ansible playbook
         env:
           SSH_KEY: ~/.ssh/wits_a
