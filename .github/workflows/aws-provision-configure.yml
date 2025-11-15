@@ -85,8 +85,8 @@ jobs:
           cat ansible/inventory/hosts
 
       # ----------------------------------------------------------
-      # 6) Decode SSH private key from base64 and validate clearly
-      #     Requires secret: SSH_PRIVATE_KEY_B64 (one long line)
+      # 6) Decode SSH private key from base64, validate it
+      #    (robust; avoids heredoc indentation issues)
       # ----------------------------------------------------------
       - name: Decode SSH key (base64) and validate
         shell: bash
@@ -96,26 +96,22 @@ jobs:
           set -euo pipefail
           mkdir -p ~/.ssh
 
-          # Decode with validation and fail with a helpful error if base64 is bad
-          python3 - <<'PY'
-          import os, base64, binascii, pathlib, sys
-          b64 = os.environ.get('KEY_B64', '').strip()
-          if not b64:
-          print('::error::Secret SSH_PRIVATE_KEY_B64 is empty.')
-          sys.exit(2)
-          try:
-          data = base64.b64decode(b64, validate=True)
-          except binascii.Error as e:
-          print(f'::error::Base64 decode failed: {e}')
-          sys.exit(3)
-          p = pathlib.Path.home() / '.ssh' / 'id_automation'
-          p.write_bytes(data)
-          PY
+          # 1) Ensure secret present
+          if [ -z "${KEY_B64:-}" ]; then
+            echo "::error::Secret SSH_PRIVATE_KEY_B64 is empty."
+            exit 2
+          fi
 
-          # Normalise CRLF if copied from Windows
+          # 2) Decode base64 (strip CR/LF just in case), show a helpful error if decode fails
+          if ! printf '%s' "$KEY_B64" | tr -d '\r\n' | base64 -d > ~/.ssh/id_automation 2>/tmp/b64.err; then
+            echo "::error::Base64 decode failed: $(cat /tmp/b64.err)"
+            exit 3
+          fi
+
+          # Normalize any CR characters
           sed -i 's/\r$//' ~/.ssh/id_automation
 
-          # Quick header sanity check
+          # 3) Quick header sanity check (does not print the key body)
           first_line="$(head -1 ~/.ssh/id_automation || true)"
           echo "Decoded key header: ${first_line}"
           if ! echo "$first_line" | grep -Eq 'BEGIN (OPENSSH|RSA) PRIVATE KEY'; then
@@ -123,12 +119,12 @@ jobs:
             exit 4
           fi
 
-          # Parse test (passphrase/truncated/wrong file => fail)
+          # 4) Make sure OpenSSH can parse the key (fails for passphrase/truncated/wrong file)
           if ! ssh-keygen -y -f ~/.ssh/id_automation >/dev/null 2>&1; then
             echo "::error::ssh-keygen could not parse the private key. Common causes:"
             echo "::error::  - Not the base64 of the *private* key"
-            echo "::error::  - Private key is passphrase-protected"
-            echo "::error::  - Base64 string is truncated/altered"
+            echo "::error::  - The private key is passphrase-protected"
+            echo "::error::  - The base64 string is truncated/altered"
             exit 5
           fi
 
@@ -151,7 +147,7 @@ jobs:
           set -euo pipefail
           ssh -i ~/.ssh/id_automation \
              -o StrictHostKeyChecking=yes \
-             -o ConnectTimeout=20 \
+             -o ConnectTimeout=25 \
              "${{ steps.tfapply.outputs.ssh_user }}@${{ steps.tfapply.outputs.public_ip }}" \
              'echo OK'
           echo "SSH OK"
