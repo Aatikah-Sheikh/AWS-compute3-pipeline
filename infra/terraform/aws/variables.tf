@@ -32,7 +32,7 @@ variable "ami_id" {
 variable "instance_type" {
   type        = string
   description = "EC2 instance type"
-  default     = "t3.micro"
+  default     = "t3.small"   # use t3.micro if you want smaller
 }
 
 variable "ssh_cidr" {
@@ -43,6 +43,11 @@ variable "ssh_cidr" {
 variable "public_key" {
   type        = string
   description = "Your SSH public key (single line: ssh-ed25519 ...)"
+}
+
+variable "key_name" {
+  type        = string
+  description = "Name of the EC2 Key Pair in AWS (e.g., wits-a-key)"
 }
 
 variable "ssh_user" {
