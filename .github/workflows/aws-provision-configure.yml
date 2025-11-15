@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "cloud provider: aws or oci"
+        description: "cloud provider: aws"
         required: true
         default: "aws"
 
@@ -15,30 +15,40 @@ jobs:
       TF_IN_AUTOMATION: "true"
 
     steps:
-      # -------------------------
-      # 1) Repo / Terraform / AWS
-      # -------------------------
+      # ----------------------------------------------------------
+      # 0) Checkout
+      # ----------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
+      # ----------------------------------------------------------
+      # 1) Setup Terraform
+      # ----------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # ----------------------------------------------------------
+      # 2) Configure AWS credentials
+      # ----------------------------------------------------------
       - name: Configure AWS credentials
-        if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
+      # ----------------------------------------------------------
+      # 3) Terraform init + apply
+      # ----------------------------------------------------------
       - name: Terraform Init
-        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        working-directory: infra/terraform/aws
         run: terraform init -input=false
 
       - name: Terraform Apply
-        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        id: tfapply
+        working-directory: infra/terraform/aws
         run: |
+          set -euo pipefail
           terraform apply -auto-approve \
             -var="region=${{ secrets.AWS_REGION }}" \
             -var="name=${{ secrets.CLUSTER_NAME }}" \
@@ -50,98 +60,58 @@ jobs:
             -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
+          echo "done=1" >> $GITHUB_OUTPUT
 
-      # -------------------------
-      # 2) Read Terraform outputs
-      # -------------------------
+      # ----------------------------------------------------------
+      # 4) Read TF outputs (public_ip, ssh_user)
+      # ----------------------------------------------------------
       - name: Read Terraform outputs
         id: tfout
-        working-directory: infra/terraform/${{ github.event.inputs.provider }}
-        shell: bash
+        working-directory: infra/terraform/aws
         run: |
-          set -e
-          # Compute node public IP (required)
-          COMPUTE_IP="$(terraform output -raw public_ip)"
-          echo "compute_ip=$COMPUTE_IP" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          echo "public_ip=$(terraform output -raw public_ip)"   >> $GITHUB_OUTPUT
+          echo "ssh_user=$(terraform output -raw ssh_user)"     >> $GITHUB_OUTPUT
 
-          # SSH user (fallback to secret if TF doesn’t output)
-          if terraform output -json | jq -e 'has("ssh_user")' >/dev/null 2>&1; then
-            SSH_USER="$(terraform output -raw ssh_user)"
-          else
-            SSH_USER="${{ secrets.SSH_USER }}"
-          fi
-          echo "ssh_user=$SSH_USER" >> "$GITHUB_OUTPUT"
-
-      # -------------------------
-      # 3) SSH: private key + known_hosts
-      # -------------------------
+      # ----------------------------------------------------------
+      # 5) Write SSH private key from secret to ~/.ssh/wits_a
+      # ----------------------------------------------------------
       - name: Write SSH private key
-        shell: bash
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          umask 077
-          # Ensure trailing newline so OpenSSH doesn't choke
-          printf "%s\n" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/wits_a
+          printf "%s" "${{ secrets.PRIVATE_KEY }}" > ~/.ssh/wits_a
           chmod 600 ~/.ssh/wits_a
 
-      - name: Show private key fingerprint (for matching)
-        shell: bash
+      # ----------------------------------------------------------
+      # 6) Add hosts to known_hosts (avoid StrictHostKeyChecking prompts)
+      #    - headnode public IP (from secret)
+      #    - compute node public IP (from terraform output)
+      # ----------------------------------------------------------
+      - name: Add hosts to known_hosts
         run: |
-          # Not required, but useful to verify the key parses
-          ssh-keygen -y -f ~/.ssh/wits_a > ~/.ssh/wits_a.pub || true
-          head -n 1 ~/.ssh/wits_a.pub || true
+          set -euo pipefail
+          : "${{ secrets.HEADNODE_PUBLIC_IP }}"
+          ssh-keyscan -T 15 -H "${{ secrets.HEADNODE_PUBLIC_IP }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -T 15 -H "${{ steps.tfout.outputs.public_ip }}" >> ~/.ssh/known_hosts
 
-      - name: Add hosts to known_hosts (avoid StrictHostKeyChecking prompts)
-        shell: bash
-        env:
-          HEADNODE_PUB: ${{ secrets.HEADNODE_PUBLIC_IP }}   # optional (set in repo secrets)
-          COMPUTE_PUB:  ${{ steps.tfout.outputs.compute_ip }}
-        run: |
-          set -e
-          mkdir -p ~/.ssh
-          touch ~/.ssh/known_hosts
-
-          echo "Using headnode public IP: ${HEADNODE_PUB:-<empty>}"
-          echo "Using compute public IP:  ${COMPUTE_PUB:-<empty>}"
-
-          for H in "$HEADNODE_PUB" "$COMPUTE_PUB"; do
-            if [ -z "$H" ]; then
-              echo "::warning :: skipping ssh-keyscan because host is empty"
-              continue
-            fi
-            # Try both raw IP and [IP]; ignore transient failures
-            ssh-keyscan -T 5 -H "$H"   >> ~/.ssh/known_hosts 2>/dev/null || true
-            ssh-keyscan -T 5 -H "[$H]" >> ~/.ssh/known_hosts 2>/dev/null || true
-          done
-
-          echo "--- known_hosts (first lines) ---"
-          sed -n '1,10p' ~/.ssh/known_hosts || true
-
-      # -------------------------
-      # 4) Ansible inventory
-      # -------------------------
+      # ----------------------------------------------------------
+      # 7) Create ansible/inventory and write hosts file
+      # ----------------------------------------------------------
       - name: Create inventory directory
         run: mkdir -p ansible/inventory
 
       - name: Write Ansible inventory
-        shell: bash
-        env:
-          COMPUTE_PUB:  ${{ steps.tfout.outputs.compute_ip }}
-          SSH_USER:     ${{ steps.tfout.outputs.ssh_user }}
         run: |
-          INV="$GITHUB_WORKSPACE/ansible/inventory/hosts"
-          mkdir -p "$(dirname "$INV")"
-          {
-            echo "[compute]"
-            echo "${COMPUTE_PUB} ansible_user=${SSH_USER}"
-          } > "$INV"
+          set -euo pipefail
+          cat > ansible/inventory/hosts <<EOF
+[compute]
+${{ steps.tfout.outputs.public_ip }} ansible_user=${{ steps.tfout.outputs.ssh_user }}
+EOF
 
-      - name: Show generated Ansible inventory
-        run: cat ansible/inventory/hosts
-
-      # -------------------------
-      # 5) Python / Ansible
-      # -------------------------
+      # ----------------------------------------------------------
+      # 8) Setup Python + Ansible
+      # ----------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -150,16 +120,16 @@ jobs:
       - name: Install Ansible
         run: pip install ansible
 
-      # -------------------------
-      # 6) Run Ansible
-      # -------------------------
+      # ----------------------------------------------------------
+      # 9) Run Ansible (HEADNODE_PUBLIC_IP is passed via env)
+      # ----------------------------------------------------------
       - name: Run Ansible playbook
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
           SSH_USER: ${{ steps.tfout.outputs.ssh_user }}
+          HEADNODE_PUBLIC_IP: ${{ secrets.HEADNODE_PUBLIC_IP }}
         run: |
+          set -euo pipefail
           cd ansible
-          # Quick reachability check with our SSH key
           ansible -i inventory/hosts all -m ping -u "$SSH_USER" --private-key ~/.ssh/wits_a
-          # Run your site playbook
           ansible-playbook -i inventory/hosts site.yml -u "$SSH_USER" --private-key ~/.ssh/wits_a
