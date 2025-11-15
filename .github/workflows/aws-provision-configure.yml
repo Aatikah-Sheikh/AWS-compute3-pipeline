@@ -15,22 +15,32 @@ jobs:
       TF_IN_AUTOMATION: "true"
 
     steps:
-      # 0) Checkout
+      # ----------------------------------------------------------
+      # 1) Checkout
+      # ----------------------------------------------------------
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 1) Terraform
+      # ----------------------------------------------------------
+      # 2) Terraform setup
+      # ----------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
+      # ----------------------------------------------------------
+      # 3) Configure AWS credentials (only if aws)
+      # ----------------------------------------------------------
       - name: Configure AWS credentials
         if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
+          aws-region:            ${{ secrets.AWS_REGION }}
 
+      # ----------------------------------------------------------
+      # 4) Terraform init/apply
+      # ----------------------------------------------------------
       - name: Terraform Init
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: terraform init -input=false
@@ -38,68 +48,92 @@ jobs:
       - name: Terraform Apply
         id: tfapply
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
-        env:
-          TF_VAR_region:     ${{ secrets.AWS_REGION }}
-          TF_VAR_name:       ${{ secrets.CLUSTER_NAME }}
-          TF_VAR_vpc_id:     ${{ secrets.AWS_VPC_ID }}
-          TF_VAR_vpc_cidr:   ${{ secrets.AWS_VPC_CIDR }}
-          TF_VAR_subnet_id:  ${{ secrets.AWS_SUBNET_ID }}
-          TF_VAR_ami_id:     ${{ secrets.AWS_AMI_ID }}
-          TF_VAR_ssh_cidr:   ${{ secrets.SSH_CIDR }}
-          TF_VAR_key_name:   ${{ secrets.AWS_KEY_NAME }}
-          TF_VAR_public_key: ${{ secrets.PUBLIC_KEY }}
-          TF_VAR_ssh_user:   ${{ secrets.SSH_USER }}
-        run: terraform apply -auto-approve
-
-      # 2) Read Terraform outputs
-      - name: Install jq (for parsing outputs)
-        run: sudo apt-get update && sudo apt-get install -y jq
-
-      - name: Read Terraform outputs (JSON)
-        id: tfout
-        working-directory: infra/terraform/${{ github.event.inputs.provider }}
         shell: bash
         run: |
-          j=$(terraform output -json)
-          echo "public_ip=$(echo "$j" | jq -r '.public_ip.value')" >> "$GITHUB_OUTPUT"
-          echo "ssh_user=$(echo "$j" | jq -r '.ssh_user.value')" >> "$GITHUB_OUTPUT"
+          set -euo pipefail
+          terraform apply -auto-approve \
+            -var="region=${{ secrets.AWS_REGION }}" \
+            -var="name=${{ secrets.CLUSTER_NAME }}" \
+            -var="vpc_id=${{ secrets.AWS_VPC_ID }}" \
+            -var="vpc_cidr=${{ secrets.AWS_VPC_CIDR }}" \
+            -var="subnet_id=${{ secrets.AWS_SUBNET_ID }}" \
+            -var="ami_id=${{ secrets.AWS_AMI_ID }}" \
+            -var="ssh_cidr=${{ secrets.SSH_CIDR }}" \
+            -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
+            -var="public_key=${{ secrets.PUBLIC_KEY }}" \
+            -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # 3) Write Ansible inventory
-      - name: Write inventory
+          # Export TF outputs for later steps
+          echo "public_ip=$(terraform output -raw public_ip)" >> "$GITHUB_OUTPUT"
+          echo "ssh_user=$(terraform output -raw ssh_user)" >> "$GITHUB_OUTPUT"
+
+      # ----------------------------------------------------------
+      # 5) Create Ansible inventory
+      # ----------------------------------------------------------
+      - name: Create inventory directory
+        run: mkdir -p ansible/inventory
+
+      - name: Write Ansible inventory
         shell: bash
         run: |
-          mkdir -p ansible/inventory
-          cat > ansible/inventory/hosts <<EOF
-          [compute]
-          ${{ steps.tfout.outputs.public_ip }} ansible_user=${{ steps.tfout.outputs.ssh_user }}
-          EOF
-          echo "Wrote ansible/inventory/hosts"
+          set -euo pipefail
+          {
+            echo "[compute]"
+            echo "${{ steps.tfapply.outputs.public_ip }} ansible_user=${{ steps.tfapply.outputs.ssh_user }}"
+          } > ansible/inventory/hosts
+          echo "Inventory written:"
           cat ansible/inventory/hosts
 
-      # 4) SSH key from base64 secret (single long line)
+      # ----------------------------------------------------------
+      # 6) Write SSH private key from base64 (robust)
+      # ----------------------------------------------------------
       - name: Write SSH key (decoded from base64)
         shell: bash
+        env:
+          KEY_B64: ${{ secrets.SSH_PRIVATE_KEY_B64 }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_PRIVATE_KEY_B64 }}" | base64 -d > ~/.ssh/id_automation
-          chmod 600 ~/.ssh/id_automation
-          # Sanity check (exit 0 if valid)
-          ssh-keygen -yf ~/.ssh/id_automation >/dev/null
 
+          # decode with python to avoid echo/quoting issues
+          python3 - <<'PY' > ~/.ssh/id_automation
+import os, base64, sys
+data = os.environ['KEY_B64']
+sys.stdout.buffer.write(base64.b64decode(data))
+PY
+
+          # strip possible CR characters (Windows copy)
+          sed -i 's/\r$//' ~/.ssh/id_automation
+          chmod 600 ~/.ssh/id_automation
+
+          # sanity check: fails non-zero if key is not parseable
+          ssh-keygen -yf ~/.ssh/id_automation > /dev/null
+          echo "SSH private key written and validated."
+
+      # ----------------------------------------------------------
+      # 7) Add host key & test SSH
+      # ----------------------------------------------------------
       - name: Add host key
         shell: bash
         run: |
-          ssh-keyscan -H ${{ steps.tfout.outputs.public_ip }} >> ~/.ssh/known_hosts 2>/dev/null || true
-          tail -n 2 ~/.ssh/known_hosts || true
+          set -euo pipefail
+          ssh-keyscan -H "${{ steps.tfapply.outputs.public_ip }}" >> ~/.ssh/known_hosts
+          echo "Host key added for ${{ steps.tfapply.outputs.public_ip }}"
 
       - name: Test SSH connectivity
         shell: bash
         run: |
-          ssh -o ConnectTimeout=15 -o StrictHostKeyChecking=no \
-              -i ~/.ssh/id_automation \
-              ${{ steps.tfout.outputs.ssh_user }}@${{ steps.tfout.outputs.public_ip }} "uname -a && echo 'SSH OK'"
+          set -euo pipefail
+          ssh -i ~/.ssh/id_automation \
+             -o StrictHostKeyChecking=yes \
+             -o ConnectTimeout=20 \
+             "${{ steps.tfapply.outputs.ssh_user }}@${{ steps.tfapply.outputs.public_ip }}" \
+             'echo OK'
+          echo "SSH OK"
 
-      # 5) Ansible (optional site.yml)
+      # ----------------------------------------------------------
+      # 8) Install Ansible & ping
+      # ----------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -108,18 +142,8 @@ jobs:
       - name: Install Ansible
         run: pip install ansible
 
-      - name: Run Ansible (ping + optional site.yml)
-        working-directory: ansible
-        env:
-          ANSIBLE_HOST_KEY_CHECKING: "false"
+      - name: Ping with Ansible
         shell: bash
         run: |
-          ansible -i inventory/hosts all -m ping \
-            --ssh-extra-args="-i ~/.ssh/id_automation -o StrictHostKeyChecking=no"
-
-          if [ -f site.yml ]; then
-            ansible-playbook -i inventory/hosts site.yml \
-              --ssh-extra-args="-i ~/.ssh/id_automation -o StrictHostKeyChecking=no"
-          else
-            echo "No site.yml found; ping-only completed."
-          fi
+          set -euo pipefail
+          ansible -i ansible/inventory/hosts all -m ping --private-key ~/.ssh/id_automation
