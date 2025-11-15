@@ -15,15 +15,15 @@ jobs:
       TF_IN_AUTOMATION: "true"
 
     steps:
-      # 1) Checkout
+      # 1) Repo
       - name: Checkout
         uses: actions/checkout@v4
 
-      # 2) Terraform CLI
+      # 2) Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # 3) AWS credentials (only when provider == aws)
+      # 3) AWS creds
       - name: Configure AWS credentials
         if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
@@ -32,19 +32,19 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # 4) Discover GitHub Runner public IP and make it /32
+      # 4) Discover runner public IP and use as /32 for SSH ingress
       - name: Discover runner public IP
         id: runnerip
         shell: bash
         run: |
           echo "runner_cidr=$(curl -s https://checkip.amazonaws.com)/32" >> "$GITHUB_OUTPUT"
 
-      # 5) Terraform Init
+      # 5) Terraform init
       - name: Terraform Init
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: terraform init -input=false
 
-      # 6) Terraform Apply (use runner IP for SSH)
+      # 6) Terraform apply (note ssh_cidr is the runner IP)
       - name: Terraform Apply
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         env:
@@ -62,19 +62,28 @@ jobs:
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # 7) Create inventory directory
+      # 7) Inventory dir
       - name: Create inventory directory
         run: mkdir -p ansible/inventory
 
-      # 8) Write SSH private key for Ansible from secret
+      # 8) Write SSH private key SAFELY (remove CRs, set perms)
       - name: Write SSH private key
         shell: bash
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          # strip any Windows CR characters to avoid "error in libcrypto"
+          printf '%s' "${{ secrets.PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-      # 9) Generate inventory from Terraform outputs (with key path)
+      # 9) (Optional but helpful) Derive and show fingerprint of this key
+      - name: Show private key fingerprint (for matching)
+        shell: bash
+        run: |
+          ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
+          echo "Fingerprint of private key:"
+          ssh-keygen -lf ~/.ssh/id_ed25519.pub
+
+      # 10) Build inventory from Terraform outputs; force IdentitiesOnly
       - name: Generate Ansible inventory
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         shell: bash
@@ -83,10 +92,9 @@ jobs:
           SSH_USER=$(terraform output -raw ssh_user)
           INV="$GITHUB_WORKSPACE/ansible/inventory/hosts"
           mkdir -p "$(dirname "$INV")"
-          printf "[compute]\n%s ansible_user=%s ansible_ssh_private_key_file=%s\n" \
+          printf "[compute]\n%s ansible_user=%s ansible_ssh_private_key_file=%s ansible_ssh_common_args='-o IdentitiesOnly=yes'\n" \
             "$PUBLIC_IP" "$SSH_USER" "~/.ssh/id_ed25519" > "$INV"
 
-      # 10) Show inventory (debug)
       - name: Show generated Ansible inventory
         run: cat ansible/inventory/hosts
 
