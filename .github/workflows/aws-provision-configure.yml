@@ -23,7 +23,7 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # 3) AWS creds
+      # 3) AWS auth (only when provider == aws)
       - name: Configure AWS credentials
         if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
@@ -32,23 +32,14 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # 4) Discover runner public IP and use as /32 for SSH ingress
-      - name: Discover runner public IP
-        id: runnerip
-        shell: bash
-        run: |
-          echo "runner_cidr=$(curl -s https://checkip.amazonaws.com)/32" >> "$GITHUB_OUTPUT"
-
-      # 5) Terraform init
+      # 4) TF init
       - name: Terraform Init
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: terraform init -input=false
 
-      # 6) Terraform apply (note ssh_cidr is the runner IP)
+      # 5) TF apply (creates key pair, SG, instance)
       - name: Terraform Apply
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
-        env:
-          RUNNER_CIDR: ${{ steps.runnerip.outputs.runner_cidr }}
         run: |
           terraform apply -auto-approve \
             -var="region=${{ secrets.AWS_REGION }}" \
@@ -57,48 +48,46 @@ jobs:
             -var="vpc_cidr=${{ secrets.AWS_VPC_CIDR }}" \
             -var="subnet_id=${{ secrets.AWS_SUBNET_ID }}" \
             -var="ami_id=${{ secrets.AWS_AMI_ID }}" \
-            -var="ssh_cidr=${RUNNER_CIDR}" \
+            -var="ssh_cidr=${{ secrets.SSH_CIDR }}" \
             -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # 7) Inventory dir
-      - name: Create inventory directory
-        run: mkdir -p ansible/inventory
-
-      # 8) Write SSH private key SAFELY (remove CRs, set perms)
-      - name: Write SSH private key
-        shell: bash
-        run: |
-          mkdir -p ~/.ssh
-          # strip any Windows CR characters to avoid "error in libcrypto"
-          printf '%s' "${{ secrets.PRIVATE_KEY }}" | tr -d '\r' > ~/.ssh/id_ed25519
-          chmod 600 ~/.ssh/id_ed25519
-
-      # 9) (Optional but helpful) Derive and show fingerprint of this key
-      - name: Show private key fingerprint (for matching)
-        shell: bash
-        run: |
-          ssh-keygen -y -f ~/.ssh/id_ed25519 > ~/.ssh/id_ed25519.pub
-          echo "Fingerprint of private key:"
-          ssh-keygen -lf ~/.ssh/id_ed25519.pub
-
-      # 10) Build inventory from Terraform outputs; force IdentitiesOnly
+      # 6) Build ansible/inventory from TF outputs
       - name: Generate Ansible inventory
+        id: inv
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         shell: bash
         run: |
           PUBLIC_IP=$(terraform output -raw public_ip)
           SSH_USER=$(terraform output -raw ssh_user)
-          INV="$GITHUB_WORKSPACE/ansible/inventory/hosts"
-          mkdir -p "$(dirname "$INV")"
-          printf "[compute]\n%s ansible_user=%s ansible_ssh_private_key_file=%s ansible_ssh_common_args='-o IdentitiesOnly=yes'\n" \
-            "$PUBLIC_IP" "$SSH_USER" "~/.ssh/id_ed25519" > "$INV"
+          mkdir -p "$GITHUB_WORKSPACE/ansible/inventory"
+          printf "[compute]\n%s ansible_user=%s\n" "$PUBLIC_IP" "$SSH_USER" > "$GITHUB_WORKSPACE/ansible/inventory/hosts"
+          echo "public_ip=$PUBLIC_IP" >> $GITHUB_OUTPUT
+          echo "ssh_user=$SSH_USER"   >> $GITHUB_OUTPUT
 
       - name: Show generated Ansible inventory
         run: cat ansible/inventory/hosts
 
-      # 11) Python & Ansible
+      # 7) Write your PRIVATE key (from GitHub Secret) to ~/.ssh/wits_a
+      - name: Write SSH private key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PRIVATE_KEY }}" > ~/.ssh/wits_a
+          chmod 600 ~/.ssh/wits_a
+
+      # (optional) Print its public key to confirm it parses
+      - name: Show private key fingerprint (for matching)
+        run: |
+          ssh-keygen -y -f ~/.ssh/wits_a > ~/.ssh/wits_a.pub || true
+          cat ~/.ssh/wits_a.pub || true
+
+      # 8) Pre-accept host key to avoid interactive prompt
+      - name: Add host to known_hosts
+        run: |
+          ssh-keyscan -H "${{ steps.inv.outputs.public_ip }}" >> ~/.ssh/known_hosts
+
+      # 9) Python / Ansible
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -107,12 +96,13 @@ jobs:
       - name: Install Ansible
         run: pip install ansible
 
-      # 12) Run Ansible
+      # 10) Run Ansible using the private key
       - name: Run Ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
-        shell: bash
+          ANSIBLE_PRIVATE_KEY_FILE:  "~/.ssh/wits_a"
         run: |
           cd ansible
-          ansible -i inventory/hosts all -m ping --ssh-extra-args="-o StrictHostKeyChecking=no"
-          ansible-playbook -i inventory/hosts site.yml --ssh-extra-args="-o StrictHostKeyChecking=no"
+          ansible -i inventory/hosts all -m ping --private-key ~/.ssh/wits_a
+          # If you have a playbook:
+          # ansible-playbook -i inventory/hosts site.yml --private-key ~/.ssh/wits_a --ssh-extra-args="-o StrictHostKeyChecking=no"
