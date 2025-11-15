@@ -81,13 +81,21 @@ resource "aws_instance" "compute3" {
   EOF
 }
 
+# Public IP of the new instance
 output "public_ip" {
   value = aws_instance.compute3.public_ip
 }
 
+# SSH username (comes from your variable)
+output "ssh_user" {
+  value = var.ssh_user
+}
+
+# Optional: one-shot inventory string
 output "ansible_inventory" {
   value = <<-EOT
 [compute]
 ${aws_instance.compute3.public_ip} ansible_user=${var.ssh_user}
 EOT
 }
+
