@@ -15,21 +15,15 @@ jobs:
       TF_IN_AUTOMATION: "true"
 
     steps:
-      # ----------------------------------------------------------
-      # 1. Checkout Repository
-      # ----------------------------------------------------------
+      # 1. Checkout
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ----------------------------------------------------------
       # 2. Setup Terraform
-      # ----------------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # ----------------------------------------------------------
-      # 3. Configure AWS Credentials
-      # ----------------------------------------------------------
+      # 3. Configure AWS credentials
       - name: Configure AWS credentials
         if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
@@ -38,16 +32,12 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # ----------------------------------------------------------
-      # 4. Terraform Init
-      # ----------------------------------------------------------
+      # 4. Terraform init
       - name: Terraform Init
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: terraform init -input=false
 
-      # ----------------------------------------------------------
-      # 5. Terraform Apply
-      # ----------------------------------------------------------
+      # 5. Terraform apply (writes state + outputs)
       - name: Terraform Apply
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: |
@@ -63,15 +53,11 @@ jobs:
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # ----------------------------------------------------------
       # 6. Create ansible/inventory directory
-      # ----------------------------------------------------------
       - name: Create inventory directory
         run: mkdir -p ansible/inventory
 
-      # ----------------------------------------------------------
       # 7. Generate inventory from Terraform outputs
-      # ----------------------------------------------------------
       - name: Generate Ansible inventory
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         shell: bash
@@ -79,33 +65,24 @@ jobs:
           PUBLIC_IP=$(terraform output -raw public_ip)
           SSH_USER=$(terraform output -raw ssh_user)
           INV="$GITHUB_WORKSPACE/ansible/inventory/hosts"
-
           mkdir -p "$(dirname "$INV")"
           printf "[compute]\n%s ansible_user=%s\n" "$PUBLIC_IP" "$SSH_USER" > "$INV"
 
-      # ----------------------------------------------------------
       # 8. Show inventory
-      # ----------------------------------------------------------
       - name: Show generated Ansible inventory
         run: cat ansible/inventory/hosts
 
-      # ----------------------------------------------------------
       # 9. Setup Python
-      # ----------------------------------------------------------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
 
-      # ----------------------------------------------------------
       # 10. Install Ansible
-      # ----------------------------------------------------------
       - name: Install Ansible
         run: pip install ansible
 
-      # ----------------------------------------------------------
       # 11. Run Ansible
-      # ----------------------------------------------------------
       - name: Run Ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
@@ -113,21 +90,3 @@ jobs:
           cd ansible
           ansible -i inventory/hosts all -m ping
           ansible-playbook -i inventory/hosts site.yml --ssh-extra-args="-o StrictHostKeyChecking=no"
-
-# Public IP of the new instance
-  output "public_ip" {
-    value = aws_instance.compute3.public_ip
-  }
-
-# SSH username passed in via variables (ubuntu for Ubuntu AMIs)
-  output "ssh_user" {
-    value = var.ssh_user
-  }
-
-# (Optional) single-shot inventory string if you ever want it
-  output "ansible_inventory" {
-    value = <<-EOT
-  [compute]
-  ${aws_instance.compute3.public_ip} ansible_user=${var.ssh_user}
-  EOT
-}
