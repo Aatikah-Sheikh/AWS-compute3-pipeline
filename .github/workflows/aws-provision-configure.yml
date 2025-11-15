@@ -60,10 +60,10 @@ jobs:
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: |
           set -euo pipefail
-          echo "public_ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
-          echo "ssh_user=$(terraform output -raw ssh_user)" >> $GITHUB_OUTPUT
+          echo "public_ip=$(terraform output -raw public_ip)"   >> $GITHUB_OUTPUT
+          echo "ssh_user=$(terraform output -raw ssh_user)"     >> $GITHUB_OUTPUT
 
-      # 6) Create inventory and write the compute target (NO heredoc)
+      # 6) Create inventory and write the compute target (no heredoc)
       - name: Create inventory directory
         run: mkdir -p ansible/inventory
 
@@ -77,38 +77,37 @@ jobs:
           echo "Wrote ansible/inventory/hosts:"
           cat ansible/inventory/hosts
 
-      # 7) Install our SSH private key for Ansible/ssh
+      # 7) Install SSH private key (robust handling)
+      # Recommended: create a base64-encoded secret SSH_PRIVATE_KEY_B64 of your private key.
+      # If you only have SSH_PRIVATE_KEY (raw), we still handle CRLF removal.
       - name: Write SSH private key
+        shell: bash
         run: |
           set -euo pipefail
           install -m 700 -d ~/.ssh
-          printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+
+          if [[ -n "${{ secrets.SSH_PRIVATE_KEY_B64 || '' }}" ]]; then
+            echo "${{ secrets.SSH_PRIVATE_KEY_B64 }}" | base64 -d > ~/.ssh/id_ed25519
+          else
+            # Fall back to raw secret
+            printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          fi
+
+          # Remove any Windows CRs just in case
+          sed -i 's/\r$//' ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-      # 8) Add the compute host key to known_hosts to avoid prompts
+          echo "Private key fingerprint (ssh-keygen -lf):"
+          # If this fails, the key is malformed
+          ssh-keygen -lf ~/.ssh/id_ed25519 || (echo "ERROR: private key unreadable; check secret formatting" >&2; exit 1)
+
+      # 8) Add compute host key to known_hosts
       - name: Add host to known_hosts
         run: |
           set -euo pipefail
           ssh-keyscan -H "${{ steps.tfout.outputs.public_ip }}" >> ~/.ssh/known_hosts || true
 
-      # 9) Setup Python + Ansible
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.x"
-
-      - name: Install Ansible
-        run: |
-          python -m pip install --upgrade pip
-          pip install "ansible>=9.0.0"
-
-      # 10) Run Ansible (headnode_ip OPTIONAL)
-      - name: Run Ansible
+      # 9) Preflight SSH check (fail fast with a clear message)
+      - name: Preflight SSH connectivity
         env:
-          ANSIBLE_HOST_KEY_CHECKING: "false"
-        run: |
-          set -euo pipefail
-          cd ansible
-          ansible -i inventory/hosts all -m ping
-          HEADNODE_IP="${{ secrets.HEADNODE_PRIVATE_IP }}"
-          ansible-playbook -i inventory/hosts site.yml --extra-vars "headnode_ip=${HEADNODE_IP}"
+          IP:       $
