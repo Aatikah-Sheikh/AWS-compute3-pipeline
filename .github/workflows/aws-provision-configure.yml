@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "Cloud provider (aws/oci) — using aws here"
+        description: "Cloud provider (aws)"
         required: true
         default: "aws"
 
@@ -15,33 +15,31 @@ jobs:
       TF_IN_AUTOMATION: "true"
 
     steps:
-      # 0) Checkout
-      - name: Checkout
+      # 1) Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 1) Setup Terraform
+      # 2) Setup Terraform
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # 2) Configure AWS Credentials
+      # 3) AWS Credentials
       - name: Configure AWS credentials
-        if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # 3) Terraform Init
+      # 4) Terraform Init
       - name: Terraform Init
-        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        working-directory: infra/terraform/aws
         run: terraform init -input=false
 
-      # 4) Terraform Apply
+      # 5) Terraform Apply
       - name: Terraform Apply
-        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        working-directory: infra/terraform/aws
         run: |
-          set -euo pipefail
           terraform apply -auto-approve \
             -var="region=${{ secrets.AWS_REGION }}" \
             -var="name=${{ secrets.CLUSTER_NAME }}" \
@@ -54,60 +52,60 @@ jobs:
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # 5) Capture Terraform outputs
-      - name: Read Terraform outputs
+      # 6) Capture Terraform Outputs
+      - name: Read Terraform Outputs
         id: tfout
-        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        working-directory: infra/terraform/aws
         run: |
-          set -euo pipefail
-          echo "public_ip=$(terraform output -raw public_ip)"   >> $GITHUB_OUTPUT
-          echo "ssh_user=$(terraform output -raw ssh_user)"     >> $GITHUB_OUTPUT
+          echo "public_ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
+          echo "ssh_user=$(terraform output -raw ssh_user)" >> $GITHUB_OUTPUT
 
-      # 6) Create inventory and write the compute target (no heredoc)
+      # 7) Create Inventory
       - name: Create inventory directory
         run: mkdir -p ansible/inventory
 
-      - name: Write Ansible inventory
+      - name: Write inventory
         run: |
-          set -euo pipefail
           printf "[compute]\n%s ansible_user=%s\n" \
             "${{ steps.tfout.outputs.public_ip }}" \
             "${{ steps.tfout.outputs.ssh_user }}" \
             > ansible/inventory/hosts
-          echo "Wrote ansible/inventory/hosts:"
+          echo "Inventory written:"
           cat ansible/inventory/hosts
 
-      # 7) Install SSH private key (robust handling)
-      # Recommended: create a base64-encoded secret SSH_PRIVATE_KEY_B64 of your private key.
-      # If you only have SSH_PRIVATE_KEY (raw), we still handle CRLF removal.
+      # 8) Write SSH private key
       - name: Write SSH private key
-        shell: bash
         run: |
-          set -euo pipefail
-          install -m 700 -d ~/.ssh
-
-          if [[ -n "${{ secrets.SSH_PRIVATE_KEY_B64 || '' }}" ]]; then
-            echo "${{ secrets.SSH_PRIVATE_KEY_B64 }}" | base64 -d > ~/.ssh/id_ed25519
-          else
-            # Fall back to raw secret
-            printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
-          fi
-
-          # Remove any Windows CRs just in case
+          mkdir -p ~/.ssh
+          printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           sed -i 's/\r$//' ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
+          ssh-keygen -lf ~/.ssh/id_ed25519 || (echo "Invalid key"; exit 1)
 
-          echo "Private key fingerprint (ssh-keygen -lf):"
-          # If this fails, the key is malformed
-          ssh-keygen -lf ~/.ssh/id_ed25519 || (echo "ERROR: private key unreadable; check secret formatting" >&2; exit 1)
-
-      # 8) Add compute host key to known_hosts
-      - name: Add host to known_hosts
+      # 9) Known Hosts
+      - name: Add host key
         run: |
-          set -euo pipefail
-          ssh-keyscan -H "${{ steps.tfout.outputs.public_ip }}" >> ~/.ssh/known_hosts || true
+          ssh-keyscan -H "${{ steps.tfout.outputs.public_ip }}" >> ~/.ssh/known_hosts
 
-      # 9) Preflight SSH check (fail fast with a clear message)
-      - name: Preflight SSH connectivity
-        env:
-          IP:       $
+      # 10) Preflight SSH Check
+      - name: Test SSH connectivity
+        run: |
+          ssh -o StrictHostKeyChecking=no \
+              "${{ steps.tfout.outputs.ssh_user }}@${{ steps.tfout.outputs.public_ip }}" \
+              'echo SSH OK'
+
+      # 11) Setup Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      # 12) Install Ansible
+      - name: Install Ansible
+        run: pip install ansible
+
+      # 13) Run Ansible Playbook
+      - name: Run Ansible
+        run: |
+          cd ansible
+          ansible-playbook -i inventory/hosts site.yml
