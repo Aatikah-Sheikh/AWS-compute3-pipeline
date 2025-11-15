@@ -2,19 +2,14 @@ name: Provision & Configure Compute Node 3
 
 on:
   workflow_dispatch:
-    inputs:
-      provider:
-        description: "cloud provider: aws or oci"
-        required: true
-        default: "aws"
 
 jobs:
-  provision:
+  test:
     runs-on: ubuntu-latest
-    env:
-      TF_IN_AUTOMATION: "true"
-
     steps:
+      - run: echo "Workflow detected!"
+
+ steps:
       - name: Checkout
         uses: actions/checkout@v4
 
