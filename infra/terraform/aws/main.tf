@@ -12,14 +12,19 @@ provider "aws" {
   region = var.region
 }
 
+# Key pair (unique name to avoid "already exists" errors)
 resource "aws_key_pair" "team" {
-  key_name   = var.key_name
-  public_key = var.public_key
+  key_name_prefix = "${var.name}-key-"
+  public_key      = var.public_key
+  tags = {
+    Name = "${var.name}-key"
+  }
 }
 
+# Security group (unique name to avoid "already exists" errors)
 resource "aws_security_group" "compute_sg" {
-  name   = "${var.name}-compute-sg"
-  vpc_id = var.vpc_id
+  name_prefix = "${var.name}-compute-sg-"
+  vpc_id      = var.vpc_id
 
   # SSH from your public IP
   ingress {
@@ -30,7 +35,7 @@ resource "aws_security_group" "compute_sg" {
     cidr_blocks = [var.ssh_cidr]
   }
 
-  # Allow intra-VPC traffic (all ports/protocols) so nodes can talk
+  # Intra-VPC traffic (all ports/protocols) so nodes can talk
   ingress {
     description = "Intra-VPC"
     from_port   = 0
@@ -46,8 +51,11 @@ resource "aws_security_group" "compute_sg" {
     protocol    = "-1"
     cidr_blocks = ["0.0.0.0/0"]
   }
+
+  tags = { Name = "${var.name}-compute-sg" }
 }
 
+# Compute node 3
 resource "aws_instance" "compute3" {
   ami                         = var.ami_id
   instance_type               = var.instance_type
@@ -71,6 +79,10 @@ resource "aws_instance" "compute3" {
       dnf -y install python3
     fi
   EOF
+}
+
+output "public_ip" {
+  value = aws_instance.compute3.public_ip
 }
 
 output "ansible_inventory" {
