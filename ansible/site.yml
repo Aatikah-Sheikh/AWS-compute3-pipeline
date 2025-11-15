@@ -1,4 +1,43 @@
+# ansible/site.yml
+
+- hosts: headnode
+  become: true
+  tasks:
+    - name: Install NFS server
+      ansible.builtin.apt:
+        name: nfs-kernel-server
+        state: present
+        update_cache: yes
+
+    - name: Ensure /home is exported to the VPC
+      ansible.builtin.lineinfile:
+        path: /etc/exports
+        create: yes
+        regexp: '^/home\s'
+        line: "/home {{ vpc_cidr }}(rw,sync,no_root_squash,no_subtree_check)"
+
+    - name: Reload exports
+      ansible.builtin.command: exportfs -ra
+
+    - name: Enable & restart NFS server
+      ansible.builtin.systemd:
+        name: nfs-kernel-server
+        state: restarted
+        enabled: yes
+
 - hosts: compute
   become: true
-  roles:
-    - base
+  tasks:
+    - name: Install NFS client
+      ansible.builtin.apt:
+        name: nfs-common
+        state: present
+        update_cache: yes
+
+    - name: Mount headnode:/home on /home (NFSv4.1)
+      ansible.builtin.mount:
+        src: "{{ headnode_ip }}:/home"
+        path: "/home"
+        fstype: nfs
+        opts: "vers=4.1,_netdev"
+        state: mounted
