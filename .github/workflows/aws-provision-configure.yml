@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TF_IN_AUTOMATION: "true"
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -44,9 +45,22 @@ jobs:
             -var="ami_id=${{ secrets.AWS_AMI_ID }}" \
             -var="ssh_cidr=${{ secrets.SSH_CIDR }}" \
             -var="key_name=${{ secrets.AWS_KEY_NAME }}" \
-            -var="public_key=${{ secrets.PUBLIC_KEY }}" \
+            -var="public_key='${{ secrets.PUBLIC_KEY }}'" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
-          terraform output -raw ansible_inventory > $GITHUB_WORKSPACE/ansible/inventory/hosts
+
+      - name: Create inventory directory
+        run: mkdir -p ansible/inventory
+
+      - name: Write Ansible inventory
+        working-directory: infra/terraform/${{ github.event.inputs.provider }}
+        run: |
+          PUBLIC_IP=$(terraform output -raw public_ip)
+          SSH_USER=$(terraform output -raw ssh_user)
+
+          cat <<EOF > $GITHUB_WORKSPACE/ansible/inventory/hosts
+[compute]
+${PUBLIC_IP} ansible_user=${SSH_USER}
+EOF
 
       - name: Show generated Ansible inventory
         run: cat ansible/inventory/hosts
