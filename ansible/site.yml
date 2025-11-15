@@ -1,4 +1,4 @@
----
+
 - name: Configure compute node(s)
   hosts: compute
   gather_facts: true
