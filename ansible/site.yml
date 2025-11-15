@@ -1,43 +1,51 @@
-# ansible/site.yml
-
-- hosts: headnode
+---
+- name: Configure compute node
+  hosts: compute
   become: true
+  gather_facts: yes
+
+  vars:
+    # Read the headnode IP from the environment passed by GitHub Actions
+    headnode_ip: "{{ lookup('env', 'HEADNODE_PUBLIC_IP') }}"
+    mount_src: "{{ headnode_ip }}:/home"
+    mount_path: "/home"
+
+  pre_tasks:
+    - name: Fail if headnode_ip is not provided
+      fail:
+        msg: "HEADNODE_PUBLIC_IP env var is not set; cannot mount NFS."
+      when: headnode_ip | length == 0
+
   tasks:
-    - name: Install NFS server
-      ansible.builtin.apt:
-        name: nfs-kernel-server
-        state: present
+    - name: Ensure APT cache is up to date (Ubuntu/Debian)
+      apt:
         update_cache: yes
+      when: ansible_os_family == "Debian"
 
-    - name: Ensure /home is exported to the VPC
-      ansible.builtin.lineinfile:
-        path: /etc/exports
-        create: yes
-        regexp: '^/home\s'
-        line: "/home {{ vpc_cidr }}(rw,sync,no_root_squash,no_subtree_check)"
-
-    - name: Reload exports
-      ansible.builtin.command: exportfs -ra
-
-    - name: Enable & restart NFS server
-      ansible.builtin.systemd:
-        name: nfs-kernel-server
-        state: restarted
-        enabled: yes
-
-- hosts: compute
-  become: true
-  tasks:
-    - name: Install NFS client
-      ansible.builtin.apt:
+    - name: Install NFS client (Ubuntu/Debian)
+      apt:
         name: nfs-common
         state: present
-        update_cache: yes
+      when: ansible_os_family == "Debian"
 
-    - name: Mount headnode:/home on /home (NFSv4.1)
-      ansible.builtin.mount:
-        src: "{{ headnode_ip }}:/home"
-        path: "/home"
-        fstype: nfs
-        opts: "vers=4.1,_netdev"
+    - name: Install NFS client (RHEL/CentOS/Amazon Linux)
+      package:
+        name: nfs-utils
+        state: present
+      when: ansible_os_family in ["RedHat", "Rocky", "AlmaLinux", "Amazon"]
+
+    - name: Create mountpoint
+      file:
+        path: "{{ mount_path }}"
+        state: directory
+        owner: root
+        group: root
+        mode: '0755'
+
+    - name: Mount /home from headnode via NFSv4
+      ansible.posix.mount:
+        src:  "{{ mount_src }}"
+        path: "{{ mount_path }}"
+        fstype: nfs4
+        opts: "vers=4,rw,noatime,nofail"
         state: mounted
