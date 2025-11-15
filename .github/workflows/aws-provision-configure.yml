@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "Cloud provider: aws or oci"
+        description: "cloud provider: aws or oci"
         required: true
         default: "aws"
 
@@ -15,21 +15,12 @@ jobs:
       TF_IN_AUTOMATION: "true"
 
     steps:
-      # -----------------------------------------------------
-      # 1. Checkout repository
-      # -----------------------------------------------------
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      # -----------------------------------------------------
-      # 2. Install Terraform
-      # -----------------------------------------------------
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      # -----------------------------------------------------
-      # 3. Configure AWS credentials
-      # -----------------------------------------------------
       - name: Configure AWS credentials
         if: ${{ github.event.inputs.provider == 'aws' }}
         uses: aws-actions/configure-aws-credentials@v4
@@ -38,17 +29,13 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region:            ${{ secrets.AWS_REGION }}
 
-      # -----------------------------------------------------
-      # 4. Terraform Init
-      # -----------------------------------------------------
+      # ---------- Terraform ----------
       - name: Terraform Init
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: terraform init -input=false
 
-      # -----------------------------------------------------
-      # 5. Terraform Apply
-      # -----------------------------------------------------
       - name: Terraform Apply
+        id: tfapply
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: |
           terraform apply -auto-approve \
@@ -63,73 +50,75 @@ jobs:
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # -----------------------------------------------------
-      # 6. Capture Terraform Outputs
-      # -----------------------------------------------------
-      - name: Read Terraform Outputs
+      # Capture the compute node's public IP from terraform
+      - name: Read Terraform outputs
         id: tfout
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
         run: |
-          echo "public_ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
-          echo "ssh_user=$(terraform output -raw ssh_user)" >> $GITHUB_OUTPUT
+          echo "compute_ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
 
-      # -----------------------------------------------------
-      # 7. Write Private Key locally
-      # -----------------------------------------------------
+      # ---------- SSH key for Ansible ----------
       - name: Write SSH private key
         run: |
           mkdir -p ~/.ssh
-          echo "${{ secrets.PRIVATE_KEY }}" > ~/.ssh/wits_a
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/wits_a
           chmod 600 ~/.ssh/wits_a
 
-      # -----------------------------------------------------
-      # 8. Add host to known_hosts (prevents SSH prompts)
-      # -----------------------------------------------------
-      - name: Add host to known_hosts
+      - name: Show private key fingerprint (for matching)
         run: |
-          ssh-keyscan -H "${{ steps.tfout.outputs.public_ip }}" >> ~/.ssh/known_hosts 2>/dev/null || true
+          ssh-keygen -y -f ~/.ssh/wits_a > ~/.ssh/wits_a.pub || true
+          head -n1 ~/.ssh/wits_a.pub || true
 
-      # -----------------------------------------------------
-      # 9. Create inventory directory
-      # -----------------------------------------------------
-      - name: Create inventory
+      - name: Add hosts to known_hosts (avoid StrictHostKeyChecking prompts)
+        run: |
+          ssh-keyscan -H "${{ secrets.HEADNODE_PUBLIC_IP }}" >> ~/.ssh/known_hosts
+          ssh-keyscan -H "${{ steps.tfout.outputs.compute_ip }}" >> ~/.ssh/known_hosts
+
+      # ---------- Inventory ----------
+      - name: Create inventory directory
         run: mkdir -p ansible/inventory
 
-      # -----------------------------------------------------
-      # 10. Write Ansible inventory
-      # -----------------------------------------------------
-      - name: Generate Ansible inventory
+      - name: Write Ansible inventory
+        env:
+          HEADNODE_PUB:     ${{ secrets.HEADNODE_PUBLIC_IP }}
+          HEADNODE_PRIV:    ${{ secrets.HEADNODE_PRIVATE_IP }}
+          VPC_CIDR:         ${{ secrets.AWS_VPC_CIDR }}
+          SSH_USER:         ${{ secrets.SSH_USER }}
+          COMPUTE_PUB:      ${{ steps.tfout.outputs.compute_ip }}
         run: |
-          echo "[compute]" > ansible/inventory/hosts
-          echo "${{ steps.tfout.outputs.public_ip }} ansible_user=${{ steps.tfout.outputs.ssh_user }} ansible_ssh_private_key_file=~/.ssh/wits_a" >> ansible/inventory/hosts
+          INV="$GITHUB_WORKSPACE/ansible/inventory/hosts"
+          {
+            echo "[headnode]"
+            echo "${HEADNODE_PUB} ansible_user=${SSH_USER}"
 
-      # -----------------------------------------------------
-      # 11. Show inventory (debug)
-      # -----------------------------------------------------
-      - name: Show generated inventory
+            echo
+            echo "[compute]"
+            echo "${COMPUTE_PUB} ansible_user=${SSH_USER}"
+
+            echo
+            echo "[all:vars]"
+            echo "headnode_ip=${HEADNODE_PRIV}"
+            echo "vpc_cidr=${VPC_CIDR}"
+            echo "enable_nfs=true"
+          } > "$INV"
+
+      - name: Show generated Ansible inventory
         run: cat ansible/inventory/hosts
 
-      # -----------------------------------------------------
-      # 12. Setup Python
-      # -----------------------------------------------------
+      # ---------- Ansible ----------
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.x'
+          python-version: "3.x"
 
-      # -----------------------------------------------------
-      # 13. Install Ansible
-      # -----------------------------------------------------
       - name: Install Ansible
         run: pip install ansible
 
-      # -----------------------------------------------------
-      # 14. Run Ansible
-      # -----------------------------------------------------
       - name: Run Ansible playbook
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
+          ANSIBLE_PRIVATE_KEY_FILE:  "~/.ssh/wits_a"
         run: |
           cd ansible
           ansible -i inventory/hosts all -m ping
-          ansible-playbook -i inventory/hosts site.yml --ssh-extra-args="-o StrictHostKeyChecking=no"
+          ansible-playbook -i inventory/hosts site.yml --ssh-extra-args="-o StrictHostKeyChecking=no -i ~/.ssh/wits_a"
