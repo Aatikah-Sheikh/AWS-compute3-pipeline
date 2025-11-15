@@ -97,10 +97,10 @@ jobs:
 
           # decode with python to avoid echo/quoting issues
           python3 - <<'PY' > ~/.ssh/id_automation
-import os, base64, sys
-data = os.environ['KEY_B64']
-sys.stdout.buffer.write(base64.b64decode(data))
-PY
+          import os, base64, sys
+          data = os.environ['KEY_B64']
+          sys.stdout.buffer.write(base64.b64decode(data))
+          PY
 
           # strip possible CR characters (Windows copy)
           sed -i 's/\r$//' ~/.ssh/id_automation
