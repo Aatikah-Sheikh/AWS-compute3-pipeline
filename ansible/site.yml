@@ -1,86 +1,51 @@
-# ansible/site.yml
-
-- name: Configure compute nodes
+---
+- name: Configure compute node(s)
   hosts: compute
-  become: true
   gather_facts: true
+  become: true
 
   vars:
-    # Toggle NFS mount on/off if you ever need to skip it
-    mount_nfs: true
-
-    # What to mount and where
-    headnode_export: "/home"
-    mount_point: "/home"
-
-    # Reasonable default NFS options; adjust for your environment
-    nfs_opts: "vers=4.1,nofail,_netdev,timeo=600,retrans=2"
-
-  pre_tasks:
-    - name: Set headnode_ip from env if present
-      set_fact:
-        headnode_ip: "{{ lookup('env', 'HEADNODE_PUBLIC_IP') }}"
-      when: headnode_ip is not defined and lookup('env', 'HEADNODE_PUBLIC_IP') | length > 0
-
-    - name: Show effective headnode_ip (if any)
-      debug:
-        msg: "Using headnode_ip = {{ headnode_ip }}"
-      when: headnode_ip is defined
-
-    - name: Fail if NFS requested but headnode_ip is not provided
-      fail:
-        msg: "HEADNODE_PUBLIC_IP env var (or 'headnode_ip' var) is not set; cannot mount NFS."
-      when: mount_nfs | bool and (headnode_ip is not defined or headnode_ip | length == 0)
+    # Debian/Ubuntu => nfs-common ; RHEL/Amazon => nfs-utils
+    nfs_client_pkg: "{{ 'nfs-common' if ansible_os_family == 'Debian' else 'nfs-utils' }}"
 
   tasks:
-    - name: Ensure base packages (general utilities)
+    - name: Ensure base packages
       package:
         name:
           - curl
           - git
+          - htop
         state: present
 
-    - name: Install NFS client on Debian/Ubuntu
-      apt:
-        name: nfs-common
-        state: present
-        update_cache: yes
-      when: ansible_facts.os_family == "Debian"
-
-    - name: Install NFS client on RHEL/Amazon
-      yum:
-        name: nfs-utils
-        state: present
-      when: ansible_facts.os_family in ["RedHat", "Rocky", "AlmaLinux", "Amazon"]
-
-    - name: Create mount point for NFS ({{ mount_point }})
-      file:
-        path: "{{ mount_point }}"
-        state: directory
-        owner: root
-        group: root
-        mode: "0755"
-      when: mount_nfs | bool and headnode_ip is defined
-
-    - name: Mount {{ headnode_ip }}:{{ headnode_export }} on {{ mount_point }} (NFSv4)
-      ansible.posix.mount:
-        src: "{{ headnode_ip }}:{{ headnode_export }}"
-        path: "{{ mount_point }}"
-        fstype: nfs
-        opts: "{{ nfs_opts }}"
-        state: mounted     # ensures it's mounted and present in /etc/fstab
-      when: mount_nfs | bool and headnode_ip is defined
-
-    - name: Confirm mount is active
-      command: mountpoint -q "{{ mount_point }}"
-      register: mountpoint_result
-      changed_when: false
-      failed_when: false
-      when: mount_nfs | bool and headnode_ip is defined
-
-    - name: Debug mount result
+    - name: Show effective headnode_ip (if any)
       debug:
-        msg: >
-          "Mount status for {{ mount_point }} :
-           {{ 'mounted' if (mountpoint_result.rc is defined and mountpoint_result.rc == 0) else 'not mounted' }}"
-      when: mount_nfs | bool and headnode_ip is defined
+        msg: "Using headnode_ip = {{ headnode_ip | default('') }}"
+
+    - name: Create mount point for NFS (/home)
+      file:
+        path: /home
+        state: directory
+
+    - name: Install NFS client
+      package:
+        name: "{{ nfs_client_pkg }}"
+        state: present
+      when:
+        - headnode_ip is defined
+        - headnode_ip | length > 0
+
+    - name: Mount headnode:/home on /home (NFSv4)
+      ansible.posix.mount:
+        path: /home
+        src: "{{ headnode_ip }}:/home"
+        fstype: nfs
+        opts: vers=4,_netdev
+        state: mounted
+      when:
+        - headnode_ip is defined
+        - headnode_ip | length > 0
+
+    - name: Skip note when headnode_ip not provided
+      debug:
+        msg: "No headnode_ip passed; NFS mount step skipped."
+      when: headnode_ip is not defined or headnode_ip | length == 0
