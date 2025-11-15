@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       provider:
-        description: "Cloud provider (aws/oci); only 'aws' used here"
+        description: "Cloud provider (aws/oci) — using aws here"
         required: true
         default: "aws"
 
@@ -54,7 +54,7 @@ jobs:
             -var="public_key=${{ secrets.PUBLIC_KEY }}" \
             -var="ssh_user=${{ secrets.SSH_USER }}"
 
-      # 5) Capture Terraform outputs we need (public_ip + ssh_user)
+      # 5) Capture Terraform outputs
       - name: Read Terraform outputs
         id: tfout
         working-directory: infra/terraform/${{ github.event.inputs.provider }}
@@ -63,18 +63,19 @@ jobs:
           echo "public_ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
           echo "ssh_user=$(terraform output -raw ssh_user)" >> $GITHUB_OUTPUT
 
-      # 6) Create inventory and write the compute target
+      # 6) Create inventory and write the compute target (NO heredoc)
       - name: Create inventory directory
         run: mkdir -p ansible/inventory
 
       - name: Write Ansible inventory
         run: |
           set -euo pipefail
-          cat > ansible/inventory/hosts <<EOF
-[compute]
-${{ steps.tfout.outputs.public_ip }} ansible_user=${{ steps.tfout.outputs.ssh_user }}
-EOF
-          echo "Wrote ansible/inventory/hosts"
+          printf "[compute]\n%s ansible_user=%s\n" \
+            "${{ steps.tfout.outputs.public_ip }}" \
+            "${{ steps.tfout.outputs.ssh_user }}" \
+            > ansible/inventory/hosts
+          echo "Wrote ansible/inventory/hosts:"
+          cat ansible/inventory/hosts
 
       # 7) Install our SSH private key for Ansible/ssh
       - name: Write SSH private key
@@ -84,11 +85,11 @@ EOF
           printf "%s" "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
 
-      # 8) Add the compute host key to known_hosts to avoid StrictHostKeyChecking prompts
+      # 8) Add the compute host key to known_hosts to avoid prompts
       - name: Add host to known_hosts
         run: |
           set -euo pipefail
-          ssh-keyscan -H ${{ steps.tfout.outputs.public_ip }} >> ~/.ssh/known_hosts || true
+          ssh-keyscan -H "${{ steps.tfout.outputs.public_ip }}" >> ~/.ssh/known_hosts || true
 
       # 9) Setup Python + Ansible
       - name: Setup Python
@@ -101,15 +102,13 @@ EOF
           python -m pip install --upgrade pip
           pip install "ansible>=9.0.0"
 
-      # 10) Run Ansible (headnode_ip is OPTIONAL; if unset, playbook won't try to mount)
+      # 10) Run Ansible (headnode_ip OPTIONAL)
       - name: Run Ansible
         env:
           ANSIBLE_HOST_KEY_CHECKING: "false"
         run: |
           set -euo pipefail
           cd ansible
-          # quick connectivity check
           ansible -i inventory/hosts all -m ping
-          # pass private headnode IP if you set it in secrets; otherwise empty
           HEADNODE_IP="${{ secrets.HEADNODE_PRIVATE_IP }}"
           ansible-playbook -i inventory/hosts site.yml --extra-vars "headnode_ip=${HEADNODE_IP}"
